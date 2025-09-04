@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>YOLO Eye Capture</title>
+  <style>
+    :root{--bg:#0f172a;--card:#111827;--muted:#94a3b8;--accent:#22c55e;--danger:#ef4444}
+    *{box-sizing:border-box}
+    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial;background:linear-gradient(180deg,#0b1220,#0f172a);color:#e5e7eb}
+    header{padding:18px 16px;display:flex;justify-content:center;border-bottom:1px solid #1f2937;background:#0b1220aa;backdrop-filter:blur(6px);position:sticky;top:0;z-index:30}
+    main{max-width:980px;margin:12px auto 32px;padding:0 16px}
+    .card{background:rgba(17,24,39,.9);border:1px solid #1f2937;border-radius:16px;overflow:hidden;box-shadow:0 10px 30px rgba(0,0,0,.4)}
+    .section{padding:16px;border-top:1px dashed #1f2937}
+    .section:first-child{border-top:none}
+    .grid{display:grid;gap:16px}
+    @media(min-width:900px){.grid{grid-template-columns:1.2fr .8fr}}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    input[type="text"]{width:260px;padding:10px;border-radius:10px;border:1px solid #334155;background:#0b1220;color:#e5e7eb}
+    input[type="checkbox"]{transform:scale(1.2)}
+    button{padding:12px 16px;border-radius:12px;border:1px solid #1f2937;background:#0b1220;color:#e5e7eb;cursor:pointer}
+    button.primary{background:linear-gradient(180deg,#16a34a,#16a34a 60%,#15803d);border-color:#14532d}
+    button.secondary{background:#0b1220}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    .video-wrap{position:relative;border-radius:16px;overflow:hidden;border:1px solid #1f2937}
+    video,canvas{display:block;width:100%;height:auto}
+    canvas.overlay{position:absolute;inset:0;pointer-events:none}
+    .muted{color:#94a3b8}
+    .ok{color:#22c55e}.err{color:#ef4444}
+    .kbd{font-family:ui-monospace,monospace;background:#111827;border:1px solid #1f2937;border-bottom-width:3px;padding:2px 6px;border-radius:6px;color:#cbd5e1}
+    .thumb{width:100%;border-radius:12px;border:1px solid #1f2937}
+    .mono{font-family:ui-monospace,monospace}
+
+    /* Thinner sticky toolbar with centered Capture */
+    .toolbar{
+      position:sticky; top:64px; z-index:20;
+      display:grid; grid-template-columns:1fr auto 1fr; align-items:center;
+      gap:10px; padding:6px 10px; margin:8px 0 0;
+      background:#0b1220e0; border:1px solid #1f2937; border-radius:12px; backdrop-filter:blur(6px)
+    }
+    .toolbar .left, .toolbar .right{display:flex; gap:8px; align-items:center; flex-wrap:wrap}
+    .toolbar .center{display:flex; align-items:center; justify-content:center}
+    .btn-capture{padding:12px 24px; border-radius:999px; font-size:1.05rem}
+
+    /* Front-camera unmirror (visual only) */
+    .unmirror{ transform: scaleX(-1); transform-origin: center; }
+
+    /* Thumbnails grid (for 4-shot front sequence) */
+    .thumbs-grid{ display:grid; grid-template-columns:1fr 1fr; gap:8px }
+    .thumbs-grid img{ width:100%; border-radius:10px; border:1px solid #1f2937 }
+
+    /* Quad-flash overlay */
+    .flashfx{ position:absolute; inset:0; pointer-events:none; }
+    .flashfx .quad{
+      position:absolute; width:50%; height:50%;
+      background:#ffffff; opacity:0; transition:none;
+    }
+    .quad.tl{ left:0; top:0 }      .quad.tr{ right:0; top:0 }
+    .quad.br{ right:0; bottom:0 }  .quad.bl{ left:0; bottom:0 }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+</head>
+<body>
+  <header><strong>YOLO Eye Capture</strong></header>
+
+  <main>
+    <!-- TOP TOOLBAR (thinner; no Flash button; no shortcut hint) -->
+    <div class="toolbar">
+      <div class="left">
+        <button id="start" class="primary">Start</button>
+        <button id="flip" class="secondary" disabled>Switch</button>
+      </div>
+      <div class="center">
+        <button id="capture" class="primary btn-capture" disabled>Capture</button>
+      </div>
+      <div class="right muted">
+        <span id="modelStatus">Model: not loaded</span>
+        <span>&nbsp;•&nbsp;</span><span id="fps">— fps</span>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <div class="section grid">
+        <div>
+          <h2>Consent & Identification</h2>
+          <p class="muted">Agree to use your image and enter your name to continue.</p>
+          <div class="row" style="margin-top:8px">
+            <input id="name" type="text" placeholder="Participant name" />
+            <label class="row" style="gap:8px"><input id="consent" type="checkbox"> I consent to using my image.</label>
+          </div>
+          <p id="consentStatus" class="muted" style="margin-top:6px">Status: <span id="consentIcon">❌</span> Consent/name missing</p>
+        </div>
+        <div>
+          <h3>Instructions</h3>
+          <ol class="muted" style="line-height:1.7">
+            <li>Position yourself in front of the camera.</li>
+            <li>Focus your eye on the camera.</li>
+            <li>Keep a distance of ~10–15 cm from the camera.</li>
+            <li>Open your eye wide and hold still.</li>
+            <li>When you hear the beep, press “Capture”.</li>
+          </ol>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="video-wrap" style="margin-top:6px">
+          <video id="video" playsinline muted></video>
+          <canvas id="overlay" class="overlay"></canvas>
+
+          <!-- Quad-flash overlay (front camera only) -->
+          <div id="flashFx" class="flashfx" aria-hidden="true">
+            <div class="quad tl"></div>
+            <div class="quad tr"></div>
+            <div class="quad br"></div>
+            <div class="quad bl"></div>
+          </div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <span class="muted">Camera:</span> <span id="camLabel" class="kbd">—</span>
+        </div>
+      </div>
+
+      <div class="section grid">
+        <div>
+          <h3>Result</h3>
+          <div id="thumbs" class="thumbs-grid">
+            <img id="thumb1" alt="Eye crop 1" />
+            <img id="thumb2" alt="Eye crop 2" />
+            <img id="thumb3" alt="Eye crop 3" />
+            <img id="thumb4" alt="Eye crop 4" />
+          </div>
+        </div>
+        <div>
+          <h3>Upload</h3>
+          <p class="muted">The cropped eye image(s) will be uploaded to Google Drive.</p>
+          <div id="uploadLog" class="mono muted">Ready.</div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+<script>
+/* =================== CONFIG =================== */
+const MODEL_URL = "https://huggingface.co/pedro123gtz/yolo-eye-model/resolve/main/best.onnx";
+const MODEL_INPUT_SIZE = 320;          // detección rápida (no afecta la calidad de la foto final)
+const MODEL_CONF_THRESHOLD = 0.35;
+const MODEL_IOU_THRESHOLD  = 0.45;
+const MODEL_CLASSES = ["eye"];
+
+const DRIVE_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbwKfhO1Ra2vgVfmxkRzGDUdCpMaDpjq0D_eTAQuOGs6EPSej-Oja2WLFsIIWfSyT8Xf/exec";
+const DRIVE_SECRET = "456";               // si usas token, pon el mismo en EXPECTED del Apps Script
+const DRIVE_FOLDER = "Eyes_data";
+const DRIVE_FOLDER_ID = "1xIspp2gSZ5tZKYQJ7VsVTdh2rTg2ohD4"; // tu carpe
+
+
+// Front-camera visual unmirror
+const UNMIRROR_FRONT = true;
+
+// Quad-flash timings (per quadrant)
+const QUAD_FLASH_ON_MS  = 1500; // 1.5 s ON
+const QUAD_FLASH_OFF_MS = 150;  // small gap between quadrants
+const QUAD_CAPTURE_AT_MS = Math.floor(QUAD_FLASH_ON_MS / 2); // capture mid-flash
+
+/* =================== STATE / DOM =================== */
+const $ = s => document.querySelector(s);
+const nameInput=$("#name"), consentInput=$("#consent"), consentIcon=$("#consentIcon"), consentStatus=$("#consentStatus");
+const startBtn=$("#start"), flipBtn=$("#flip"), captureBtn=$("#capture");
+const modelStatus=$("#modelStatus"), fpsLabel=$("#fps"), video=$("#video"), overlay=$("#overlay"), ctx=overlay.getContext("2d");
+const camLabel=$("#camLabel"), uploadLog=$("#uploadLog");
+const flashFx=$("#flashFx"), flashQuads=[...flashFx.querySelectorAll('.quad')];
+const thumbs=[ $("#thumb1"), $("#thumb2"), $("#thumb3"), $("#thumb4") ];
+
+let streaming=false, currentStream=null, videoTrack=null, useFrontCamera=true;
+let track=null, tick=0, RUN_EVERY=3;
+let lockedBeeped=false;
+let audioCtx=null;
+
+/* =================== CONSENT =================== */
+function updateConsentState(){
+  const ok = !!nameInput.value.trim() && consentInput.checked;
+  consentIcon.textContent = ok ? "✅" : "❌";
+  consentStatus.className = ok ? "ok" : "err";
+  startBtn.disabled = !ok;
+}
+nameInput.addEventListener('input', updateConsentState);
+consentInput.addEventListener('change', updateConsentState);
+updateConsentState();
+
+/* =================== BEEPS =================== */
+function beep(freq=880, duration=120, type='sine', gain=0.06){
+  try{
+    if(!audioCtx) audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+    const osc = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    osc.type = type; osc.frequency.value = freq; g.gain.value = gain;
+    osc.connect(g).connect(audioCtx.destination);
+    osc.start(); setTimeout(()=>osc.stop(), duration);
+  }catch(e){}
+}
+
+/* =================== YOLO API =================== */
+window.eyeapi=(function(){
+  const api={};
+  api.nets={ eyeDetector:{ session:null, async loadFromUrl(url, providers=['webgpu','wasm']){
+    for(const ep of providers){ try{ this.session=await ort.InferenceSession.create(url,{executionProviders:[ep]}); return {provider:ep}; }catch(e){} }
+    throw new Error('Could not load the model'); } } };
+  class EyeDetectorOptions{ constructor({inputSize=MODEL_INPUT_SIZE, confThreshold=MODEL_CONF_THRESHOLD, iouThreshold=MODEL_IOU_THRESHOLD}={}){ this.inputSize=inputSize; this.confThreshold=confThreshold; this.iouThreshold=iouThreshold; } }
+  api.EyeDetectorOptions=EyeDetectorOptions;
+
+  function postprocess(out,meta,ct,nt){
+    let data=out.data, nb, na;
+    if(out.dims.length===3){ const [n,a,b]=out.dims; nb=b; na=a; const tr=new Float32Array(nb*na); for(let i=0;i<a;i++) for(let j=0;j<b;j++) tr[j*na+i]=data[i*b+j]; data=tr; }
+    else if(out.dims.length===2){ nb=out.dims[0]; na=out.dims[1]; }
+    else return [];
+    const boxes=[],scores=[],classes=[],sig=x=>1/(1+Math.exp(-x));
+    for(let i=0;i<nb;i++){ const o=i*na, x=data[o],y=data[o+1],w=data[o+2],h=data[o+3]; const obj=sig(data[o+4]); let cls=1,cid=0;
+      if(na>5){ let best=0,id=0; for(let c=5;c<na;c++){ const sc=sig(data[o+c]); if(sc>best){best=sc; id=c-5;} } cls=best; cid=id; }
+      const conf=obj*cls; if(conf<ct) continue; boxes.push([x-w/2,y-h/2,x+w/2,y+h/2]); scores.push(conf); classes.push(cid); }
+    const keep=(function(b,s,iouT,maxDet=50){ const ord=s.map((v,i)=>[v,i]).sort((A,B)=>B[0]-A[0]).map(x=>x[1]); const out=[];
+      function iou(a,b){ const x1=Math.max(a[0],b[0]),y1=Math.max(a[1],b[1]),x2=Math.min(a[2],b[2]),y2=Math.min(a[3],b[3]); const w=Math.max(0,x2-x1),h=Math.max(0,y2-y1),inter=w*h,A=(a[2]-a[0])*(a[3]-a[1]),B=(b[2]-b[0])*(b[3]-b[1]); return inter/(A+B-inter+1e-6); }
+      for(const i of ord){ let ok=true; for(const j of out){ if(iou(b[i],b[j])>iouT){ ok=false; break; } } if(ok){ out.push(i); if(out.length>=maxDet) break; } } return out; })(boxes,scores,nt);
+    const res=[]; for(const i of keep){ const [x1,y1,x2,y2]=boxes[i]; const {ratio,dx,dy,iw,ih}=meta;
+      const sx1=(x1-dx)/ratio, sy1=(y1-dy)/ratio, sx2=(x2-dx)/ratio, sy2=(y2-dy)/ratio;
+      const X1=Math.max(0,Math.min(iw,sx1)), Y1=Math.max(0,Math.min(ih,sy1)), X2=Math.max(0,Math.min(iw,sx2)), Y2=Math.max(0,Math.min(ih,sy2));
+      res.push({box:[X1,Y1,X2,Y2], score:scores[i], label:(MODEL_CLASSES[classes[i]]||`c${classes[i]}`)}); }
+    return res;
+  }
+  api.detectAllEyes=async function(input,opts=new EyeDetectorOptions()){
+    const sess=api.nets.eyeDetector.session; if(!sess) throw new Error('Model not loaded');
+    const lb=letterbox(input,opts.inputSize); const px=lb.canvas.getContext('2d').getImageData(0,0,lb.canvas.width,lb.canvas.height).data;
+    const size=opts.inputSize*opts.inputSize; const arr=new Float32Array(size*3);
+    for(let i=0,p=0;i<size;i++,p+=4){ arr[i]=px[p]/255; arr[i+size]=px[p+1]/255; arr[i+2*size]=px[p+2]/255; }
+    const t0=performance.now(); const out=await sess.run({[sess.inputNames[0]]: new ort.Tensor('float32',arr,[1,3,opts.inputSize,opts.inputSize])});
+    fpsLabel.textContent=`${(1000/(performance.now()-t0)).toFixed(1)} fps`;
+    return postprocess(out[sess.outputNames[0]], lb, opts.confThreshold, opts.iouThreshold);
+  };
+  return api;
+})();
+
+/* =================== UTILS & TRACKING =================== */
+function letterbox(img,newSize){
+  const iw=img.videoWidth||img.width, ih=img.videoHeight||img.height; const r=Math.min(newSize/iw,newSize/ih);
+  const nw=Math.round(iw*r), nh=Math.round(ih*r), dx=Math.floor((newSize-nw)/2), dy=Math.floor((newSize-nh)/2);
+  const c=document.createElement('canvas'); c.width=newSize; c.height=newSize; const t=c.getContext('2d');
+  t.fillStyle='#000'; t.fillRect(0,0,newSize,newSize); t.drawImage(img,0,0,iw,ih,dx,dy,nw,nh);
+  return {canvas:c, ratio:r, dx, dy, iw, ih};
+}
+const STABILITY={ confMin:0.55, minAreaRatio:0.005, ema:0.35, iouKeep:0.50, maxCoast:6, requireStableFrames:8 };
+const area=b=>Math.max(0,b[2]-b[0])*Math.max(0,b[3]-b[1]);
+const iou=(a,b)=>{const x1=Math.max(a[0],b[0]),y1=Math.max(a[1],b[1]),x2=Math.min(a[2],b[2]),y2=Math.min(a[3],b[3]);const w=Math.max(0,x2-x1),h=Math.max(0,y2-y1),inter=w*h,A=(a[2]-a[0])*(a[3]-a[1]),B=(b[2]-b[0])*(b[3]-b[1]);return inter/(A+B-inter+1e-6);}
+const ema=(p,c,a)=>[p[0]*(1-a)+c[0]*a,p[1]*(1-a)+c[1]*a,p[2]*(1-a)+c[2]*a,p[3]*(1-a)+c[3]*a];
+function chooseBest(dets){
+  const W=overlay.width,H=overlay.height,minA=STABILITY.minAreaRatio*W*H;
+  const f=dets.filter(d=>d.score>=STABILITY.confMin && area(d.box)>=minA);
+  if(!f.length) return null; f.sort((a,b)=>b.score-a.score); return f[0];
+}
+function drawTrack(t){
+  ctx.clearRect(0,0,overlay.width,overlay.height); if(!t) return;
+  const [x1,y1,x2,y2]=t.box, w=x2-x1, h=y2-y1;
+  ctx.lineWidth=3; ctx.strokeStyle='#22c55e'; ctx.fillStyle='rgba(34,197,94,.12)';
+  ctx.beginPath(); ctx.rect(x1,y1,w,h); ctx.stroke(); ctx.fill();
+  const tag=`eye ${(t.score*100).toFixed(0)}% · ${t.stable}f`;
+  ctx.font='16px ui-monospace,monospace'; const tw=ctx.measureText(tag).width+10;
+  ctx.fillStyle='#0b1220'; ctx.fillRect(x1,Math.max(0,y1-22),tw,22);
+  ctx.fillStyle='#93c5fd'; ctx.fillText(tag,x1+5,Math.max(16,y1-6));
+}
+function updateCaptureState(){ captureBtn.disabled = !(track && track.stable>=STABILITY.requireStableFrames); }
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
+
+/* =================== CAMERA =================== */
+async function startCamera(){
+  if(currentStream){ currentStream.getTracks().forEach(t=>t.stop()); currentStream=null; videoTrack=null; }
+  const facingMode = useFrontCamera ? 'user' : 'environment';
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode, width:{ideal:1280}, height:{ideal:720} },
+      audio: false
+    });
+    currentStream=stream; video.srcObject=stream; await video.play();
+    overlay.width=video.videoWidth; overlay.height=video.videoHeight;
+    camLabel.textContent=facingMode; flipBtn.disabled=false; streaming=true;
+
+    // Visual un-mirror on front camera (video + overlay)
+    const needUnmirror = UNMIRROR_FRONT && useFrontCamera;
+    video.classList.toggle('unmirror', needUnmirror);
+    overlay.classList.toggle('unmirror', needUnmirror);
+
+    videoTrack = stream.getVideoTracks()[0];
+    await autoEnableRearTorchIfSupported();
+  }catch(err){ alert('Could not access camera: '+err.message); }
+}
+flipBtn.addEventListener('click', async ()=>{ useFrontCamera=!useFrontCamera; lockedBeeped=false; await startCamera(); });
+startBtn.addEventListener('click', async ()=>{ await startCamera(); await loadModel(); detectLoop(); });
+
+/* =================== TORCH (rear, auto only) =================== */
+async function autoEnableRearTorchIfSupported(){
+  if(!videoTrack) return;
+  if(useFrontCamera) return; // only try on rear camera
+  const caps = (typeof videoTrack.getCapabilities==='function') ? videoTrack.getCapabilities() : {};
+  if('torch' in caps){
+    try{ await videoTrack.applyConstraints({ advanced:[{ torch:true }] }); }catch(e){ /* ignore */ }
+  }
+}
+
+/* =================== MODEL =================== */
+async function loadModel(){
+  modelStatus.textContent='Model: loading…';
+  try{
+    const { provider } = await eyeapi.nets.eyeDetector.loadFromUrl(MODEL_URL, ['webgpu','wasm']);
+    const tmp=document.createElement('canvas'); tmp.width=MODEL_INPUT_SIZE; tmp.height=MODEL_INPUT_SIZE;
+    await eyeapi.detectAllEyes(tmp,new eyeapi.EyeDetectorOptions({inputSize:MODEL_INPUT_SIZE,confThreshold:0.99}));
+    modelStatus.textContent=`Model: ready (${provider})`;
+  }catch(e){ console.error(e); modelStatus.textContent='Model: load error'; }
+}
+
+/* =================== DETECT LOOP =================== */
+async function detectLoop(){
+  const opts=new eyeapi.EyeDetectorOptions({ inputSize:MODEL_INPUT_SIZE, confThreshold:MODEL_CONF_THRESHOLD, iouThreshold:MODEL_IOU_THRESHOLD });
+  while(streaming){
+    try{
+      tick++; if(tick % RUN_EVERY !== 0){ drawTrack(track); updateCaptureState(); await sleep(10); continue; }
+      const dets = await eyeapi.detectAllEyes(video, opts);
+      const best = chooseBest(dets);
+      if(!track && best){ track={ box:[...best.box], score:best.score, stable:1, coast:0 }; }
+      else if(track){
+        if(best){ const m=iou(track.box, best.box); if(m>=STABILITY.iouKeep){ track.box=ema(track.box,best.box,STABILITY.ema); track.score=best.score; track.stable++; track.coast=0; } else track.coast++; }
+        else track.coast++;
+        if(track.coast>STABILITY.maxCoast){ track=null; lockedBeeped=false; }
+      }
+      drawTrack(track); updateCaptureState();
+      if(track && track.stable>=STABILITY.requireStableFrames && !lockedBeeped){
+        beep(1175,140,'square',0.08); setTimeout(()=>beep(880,120,'sine',0.05),160); lockedBeeped=true;
+      }
+      if(!track) lockedBeeped=false;
+    }catch(e){ console.error(e); await sleep(100); }
+    await sleep(10);
+  }
+}
+
+/* =================== CAPTURE HELPERS =================== */
+function sanitizeUser(s){ return String(s||'anon').replace(/[^a-zA-Z0-9]/g,'_'); }
+
+function cropToBlob(det){
+  const [x1,y1,x2,y2]=det.xyxy?det.xyxy:det.box;
+  const X1=Math.round(x1),Y1=Math.round(y1),W=Math.max(1,Math.round(x2-x1)),H=Math.max(1,Math.round(y2-y1));
+  const c=document.createElement('canvas'); c.width=W; c.height=H;
+  c.getContext('2d').drawImage(video,X1,Y1,W,H,0,0,W,H);
+  return new Promise(res=> c.toBlob(b=>res(b),'image/jpeg',0.95));
+}
+
+/* Front quad-flash: turn quadrant fully white, capture mid-flash, then hide */
+async function flashCaptureQuadrant(qIndex){
+  const q = flashQuads[qIndex];
+  q.style.opacity = '0';
+  await new Promise(r=>requestAnimationFrame(r));
+  q.style.opacity = '1';
+  await sleep(QUAD_CAPTURE_AT_MS);
+  beep(1319,100,'square',0.12);
+  const blob = await cropToBlob({xyxy: track.box});
+  const remain = Math.max(0, QUAD_FLASH_ON_MS - QUAD_CAPTURE_AT_MS);
+  await sleep(remain);
+  q.style.opacity = '0';
+  await sleep(QUAD_FLASH_OFF_MS);
+  return blob;
+}
+
+/* =================== CAPTURE LOGIC =================== */
+async function captureRearSingle(){
+  beep(1319,100,'square',0.12);
+  const blob = await cropToBlob({xyxy: track.box});
+  thumbs[0].src = URL.createObjectURL(blob);
+  for(let i=1;i<4;i++) thumbs[i].src = '';
+  await uploadToDrive(blob);
+}
+
+async function captureFrontFour(){
+  const order = [0,1,2,3]; // TL, TR, BR, BL
+  const blobs = [];
+  for(let i=0;i<order.length;i++){
+    const b = await flashCaptureQuadrant(order[i]);
+    blobs.push(b);
+    thumbs[i].src = URL.createObjectURL(b);
+  }
+  for(const b of blobs){ await uploadToDrive(b); }
+}
+
+async function captureIfReady(){
+  if(!track || track.stable<STABILITY.requireStableFrames) return;
+  if(useFrontCamera){ await captureFrontFour(); }
+  else { await captureRearSingle(); }
+}
+captureBtn.addEventListener('click', captureIfReady);
+
+// Keyboard shortcuts (Space / Enter)
+document.addEventListener('keydown', (e)=>{
+  if (captureBtn.disabled) return;
+  if (e.code==='Space' || e.key===' ' || e.key==='Enter' || e.code==='NumpadEnter'){
+    e.preventDefault(); captureIfReady();
+  }
+});
+
+/* =================== UPLOAD (optional Drive) =================== */
+async function uploadToDrive(blob){
+  if(!DRIVE_WEBAPP_URL) return;
+  const name = sanitizeUser(nameInput.value.trim() || 'anon');
+  const ts = new Date().toISOString().replace(/[:.]/g,'-');
+  const fname = `${name}_${ts}.jpg`;
+
+  // ---- INTENTO 1: multipart/form-data ----
+  try{
+    const form = new FormData();
+    form.append('file', blob, fname);
+    form.append('name', name);
+    form.append('folderId', DRIVE_FOLDER_ID);
+    form.append('secret', DRIVE_SECRET);
+
+    const resp = await fetch(DRIVE_WEBAPP_URL, { method:'POST', body: form, cache:'no-store' });
+    const text = await resp.text();
+    let json = {};
+    try { json = JSON.parse(text); } catch(_) { /* puede ser opaque o texto plano */ }
+
+    if (resp.ok && json && json.ok) {
+      uploadLog.innerHTML = `✅ Uploaded: <a href="${json.fileUrl}" target="_blank" rel="noopener">${json.name || 'file'}</a>`;
+      return;
+    }
+    // Si el GAS dijo no_postdata o no hay JSON válido, forzamos fallback
+    if (String(text).includes('no_postdata') || !resp.ok) throw new Error(text || 'no_postdata');
+  } catch(e) {
+    // ---- INTENTO 2 (FALLBACK): application/json con base64 ----
+    try{
+      const dataUrl = await blobToDataURL(blob); // "data:image/jpeg;base64,...."
+      const resp2 = await fetch(DRIVE_WEBAPP_URL, {
+        method:'POST',
+        headers:{ 'Content-Type':'application/json' },
+        body: JSON.stringify({
+          image: dataUrl,
+          name,
+          filename: fname,
+          folderId: DRIVE_FOLDER_ID,
+          folder: 'Eyes_data',
+          secret: DRIVE_SECRET
+        })
+      });
+      const json2 = await resp2.json();
+      if(!resp2.ok || json2.error) throw new Error(`HTTP ${resp2.status} · ${json2.error || 'upload failed'}`);
+      uploadLog.innerHTML = `✅ Uploaded: <a href="${json2.fileUrl}" target="_blank" rel="noopener">${json2.name || 'file'}</a>`;
+      return;
+    }catch(e2){
+      uploadLog.textContent = 'Upload error (fallback): ' + e2.message;
+    }
+  }
+}
+
+function blobToDataURL(blob){
+  return new Promise((resolve, reject)=>{
+    const fr = new FileReader();
+    fr.onload = () => resolve(fr.result);
+    fr.onerror = reject;
+    fr.readAsDataURL(blob);
+  });
+}
+/* =================== INITIAL PING =================== */
+(async function ping(){ try{ await fetch(DRIVE_WEBAPP_URL,{method:'GET',cache:'no-store'}); }catch(_){} })();
+</script>
+</body>
+</html>
